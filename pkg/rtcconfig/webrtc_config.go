@@ -254,6 +254,67 @@ func SetNAT1To1AddressRewriteRules(s *webrtc.SettingEngine, ips []string, includ
 	return s.SetICEAddressRewriteRules(nat1To1AddressRewriteRules(ips, includeInternal)...)
 }
 
+// RefreshExternalIP discovers the current public address and returns a new ICE
+// configuration without reopening the UDP/TCP muxes owned by c. The caller
+// must publish the returned configuration atomically for new peer connections;
+// existing peer connections continue to use their original ICE settings.
+// Neither c nor rtcConf is changed if discovery fails.
+func (c *WebRTCConfig) RefreshExternalIP(rtcConf *RTCConfig) (*WebRTCConfig, NodeIP, error) {
+	if c == nil || rtcConf == nil || !rtcConf.UseExternalIP {
+		return nil, NodeIP{}, errors.New("external IP refresh requires an active WebRTC config and use_external_ip")
+	}
+
+	conf := *rtcConf
+	if err := conf.ReloadExternalIP(); err != nil {
+		return nil, NodeIP{}, err
+	}
+
+	var ifFilter func(string) bool
+	if len(conf.Interfaces.Includes) != 0 || len(conf.Interfaces.Excludes) != 0 {
+		ifFilter = InterfaceFilterFromConf(conf.Interfaces)
+	}
+	var ipFilter func(net.IP) bool
+	if len(conf.IPs.Includes) != 0 || len(conf.IPs.Excludes) != 0 {
+		filter, err := IPFilterFromConf(conf.IPs)
+		if err != nil {
+			return nil, NodeIP{}, err
+		}
+		ipFilter = filter
+	}
+
+	// The configured ICE port is already held by the live mux. A temporary
+	// socket on the same local interface discovers the current address without
+	// interrupting it. Hairpin validation on that ephemeral port is not useful:
+	// the router forwards the configured ICE port, not this probe port.
+	ips, refreshedFilter, err := discoverNAT1to1IPs(&conf, ifFilter, ipFilter, []int{0}, false)
+	if err != nil {
+		return nil, NodeIP{}, err
+	}
+	if len(ips) == 0 {
+		return nil, NodeIP{}, errors.New("external IP refresh found no NAT mappings")
+	}
+	if !slices.ContainsFunc(ips, func(mapping string) bool {
+		return strings.SplitN(mapping, "/", 2)[0] == conf.NodeIP.PrimaryIP()
+	}) {
+		return nil, NodeIP{}, fmt.Errorf("refreshed node IP %s does not match any NAT mapping", conf.NodeIP.PrimaryIP())
+	}
+	next, err := c.withExternalIPMappings(&conf, ips, refreshedFilter)
+	if err != nil {
+		return nil, NodeIP{}, err
+	}
+	return next, conf.NodeIP, nil
+}
+
+func (c *WebRTCConfig) withExternalIPMappings(conf *RTCConfig, ips []string, ipFilter func(net.IP) bool) (*WebRTCConfig, error) {
+	next := *c
+	next.NAT1To1IPs = slices.Clone(ips)
+	next.SettingEngine.SetIPFilter(ipFilter)
+	if err := SetNAT1To1AddressRewriteRules(&next.SettingEngine, ips, conf.AdvertiseInternalIP); err != nil {
+		return nil, err
+	}
+	return &next, nil
+}
+
 func nat1To1AddressRewriteRules(ips []string, includeInternal bool) []webrtc.ICEAddressRewriteRule {
 	rules := make([]webrtc.ICEAddressRewriteRule, 0, len(ips)+1)
 	catchAll := make([]string, 0, len(ips))
@@ -294,6 +355,21 @@ func iceServerForStunServers(servers []string) webrtc.ICEServer {
 }
 
 func getNAT1to1IPsForConf(rtcConf *RTCConfig, ifFilter func(string) bool, ipFilter func(net.IP) bool) ([]string, func(net.IP) bool, error) {
+	var udpPorts []int
+	if rtcConf.ICEPortRangeStart != 0 && rtcConf.ICEPortRangeEnd != 0 {
+		portRangeStart, portRangeEnd := uint16(rtcConf.ICEPortRangeStart), uint16(rtcConf.ICEPortRangeEnd)
+		for range 5 {
+			udpPorts = append(udpPorts, rand.Intn(int(portRangeEnd-portRangeStart))+int(portRangeStart))
+		}
+	} else if rtcConf.UDPPort.Valid() {
+		udpPorts = append(udpPorts, rtcConf.UDPPort.Start)
+	} else {
+		udpPorts = append(udpPorts, 0)
+	}
+	return discoverNAT1to1IPs(rtcConf, ifFilter, ipFilter, udpPorts, !rtcConf.SkipExternalIPValidation)
+}
+
+func discoverNAT1to1IPs(rtcConf *RTCConfig, ifFilter func(string) bool, ipFilter func(net.IP) bool, udpPorts []int, validate bool) ([]string, func(net.IP) bool, error) {
 	stunServers := rtcConf.STUNServers
 	if len(stunServers) == 0 {
 		stunServers = DefaultStunServers
@@ -308,18 +384,6 @@ func getNAT1to1IPsForConf(rtcConf *RTCConfig, ifFilter func(string) bool, ipFilt
 	}
 	addrCh := make(chan ipmapping, len(localIPs))
 
-	var udpPorts []int
-	if rtcConf.ICEPortRangeStart != 0 && rtcConf.ICEPortRangeEnd != 0 {
-		portRangeStart, portRangeEnd := uint16(rtcConf.ICEPortRangeStart), uint16(rtcConf.ICEPortRangeEnd)
-		for range 5 {
-			udpPorts = append(udpPorts, rand.Intn(int(portRangeEnd-portRangeStart))+int(portRangeStart))
-		}
-	} else if rtcConf.UDPPort.Valid() {
-		udpPorts = append(udpPorts, rtcConf.UDPPort.Start)
-	} else {
-		udpPorts = append(udpPorts, 0)
-	}
-
 	var wg sync.WaitGroup
 	ctx, cancel := context.WithCancel(context.Background())
 	for _, ip := range localIPs {
@@ -327,7 +391,7 @@ func getNAT1to1IPsForConf(rtcConf *RTCConfig, ifFilter func(string) bool, ipFilt
 		go func(localIP string) {
 			defer wg.Done()
 			for _, port := range udpPorts {
-				addr, err := getExternalIP(ctx, stunServers, &net.UDPAddr{IP: net.ParseIP(localIP), Port: port}, !rtcConf.SkipExternalIPValidation, "udp")
+				addr, err := getExternalIP(ctx, stunServers, &net.UDPAddr{IP: net.ParseIP(localIP), Port: port}, validate, "udp")
 				if err != nil {
 					if strings.Contains(err.Error(), "address already in use") {
 						logger.Infow("failed to get external ip, address already in use", "local", localIP, "port", port)

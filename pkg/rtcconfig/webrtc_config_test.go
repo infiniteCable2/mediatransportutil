@@ -16,8 +16,10 @@ package rtcconfig
 
 import (
 	"net"
+	"sync/atomic"
 	"testing"
 
+	"github.com/pion/stun/v3"
 	"github.com/pion/webrtc/v4"
 	"github.com/stretchr/testify/require"
 )
@@ -116,4 +118,76 @@ func Test_NAT1To1AddressRewriteRules(t *testing.T) {
 		require.Equal(t, []string{"1.2.3.4"}, rules[1].External)
 		require.Equal(t, webrtc.ICEAddressRewriteAppend, rules[1].Mode)
 	})
+}
+
+func TestWithExternalIPMappingsKeepsOriginalAndSockets(t *testing.T) {
+	listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	defer listener.Close()
+
+	current := &WebRTCConfig{TCPMuxListener: listener, NAT1To1IPs: []string{"198.51.100.10/192.0.2.10"}}
+	conf := &RTCConfig{AdvertiseInternalIP: true}
+	newIPs := []string{"198.51.100.20/192.0.2.10"}
+	next, err := current.withExternalIPMappings(conf, newIPs, nil)
+	require.NoError(t, err)
+	require.Same(t, listener, next.TCPMuxListener)
+	require.Equal(t, []string{"198.51.100.10/192.0.2.10"}, current.NAT1To1IPs)
+	require.Equal(t, newIPs, next.NAT1To1IPs)
+
+	newIPs[0] = "198.51.100.30/192.0.2.10"
+	require.Equal(t, []string{"198.51.100.20/192.0.2.10"}, next.NAT1To1IPs)
+}
+
+func TestRefreshExternalIPFromLocalSTUNServer(t *testing.T) {
+	server, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	defer server.Close()
+
+	var advertised atomic.Value
+	advertised.Store("198.51.100.10")
+	go func() {
+		buf := make([]byte, 1500)
+		for {
+			n, addr, err := server.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			request := stun.New()
+			request.Raw = append(request.Raw[:0], buf[:n]...)
+			if err := request.Decode(); err != nil {
+				continue
+			}
+			response, err := stun.Build(
+				stun.BindingSuccess,
+				stun.NewTransactionIDSetter(request.TransactionID),
+				&stun.XORMappedAddress{IP: net.ParseIP(advertised.Load().(string)), Port: addr.Port},
+			)
+			if err == nil {
+				_, _ = server.WriteToUDP(response.Raw, addr)
+			}
+		}
+	}()
+
+	conf := &RTCConfig{
+		UseExternalIP:           true,
+		EnableLoopbackCandidate: true,
+		STUNServers:             []string{server.LocalAddr().String()},
+		IPs:                     IPsConfig{Includes: []string{"127.0.0.0/8"}},
+		NodeIP:                  NodeIP{V4: "198.51.100.10"},
+	}
+	initial := &WebRTCConfig{NAT1To1IPs: []string{"198.51.100.10/127.0.0.1"}}
+	advertised.Store("198.51.100.20")
+	first, firstNode, err := initial.RefreshExternalIP(conf)
+	require.NoError(t, err)
+	require.Equal(t, "198.51.100.20", firstNode.V4)
+	require.Equal(t, []string{"198.51.100.20/127.0.0.1"}, first.NAT1To1IPs)
+	require.Equal(t, "198.51.100.10", conf.NodeIP.V4)
+	require.Equal(t, []string{"198.51.100.10/127.0.0.1"}, initial.NAT1To1IPs)
+
+	advertised.Store("198.51.100.30")
+	second, secondNode, err := first.RefreshExternalIP(conf)
+	require.NoError(t, err)
+	require.Equal(t, "198.51.100.30", secondNode.V4)
+	require.Equal(t, []string{"198.51.100.30/127.0.0.1"}, second.NAT1To1IPs)
+	require.Equal(t, []string{"198.51.100.20/127.0.0.1"}, first.NAT1To1IPs)
 }
